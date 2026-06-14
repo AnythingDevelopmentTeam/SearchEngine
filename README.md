@@ -2,7 +2,8 @@
 
 Search engine for Anything — fuzzy/regex search + Everything-like query syntax.
 
-Built on top of `libanything` for filesystem scanning. Exposes a pure C ABI (`cdylib`) for FFI from any language (Qt, Python, etc.).
+Reads the YAML index produced by LibAnything (`~/.config/anything-index.yaml`).
+Exposes a pure C ABI (`cdylib`) for FFI from any language.
 
 ## Build
 
@@ -10,7 +11,7 @@ Built on top of `libanything` for filesystem scanning. Exposes a pure C ABI (`cd
 cargo build --release
 ```
 
-Output: `target/release/searchengine.{dll,so,dylib}`
+Output: `target/release/libsearchengine.{dll,so,dylib}` (includes LibAnything).
 
 ## Query Syntax
 
@@ -21,8 +22,8 @@ Output: `target/release/searchengine.{dll,so,dylib}`
 | `"phrase"` | `"annual report"` | Exact substring match |
 | `ext:ext` | `ext:pdf` | Only files with extension |
 | `ext:!ext` | `ext:!tmp` | Exclude files with extension |
-| `path:dir` | `path:C:\Docs` | Only files under path |
-| `path:!dir` | `path:!C:\Windows` | Exclude path |
+| `path:dir` | `path:/home` | Only files under path |
+| `path:!dir` | `path:!/proc` | Exclude path |
 | `*wild*` | `*report*` | Wildcard (split on `*`) |
 | Regex mode | `\.(pdf\|jpg)$` | Set at FFI call site |
 
@@ -32,12 +33,10 @@ Noise filter (always applied): `thumbs.db`, `desktop.ini`, `.DS_Store`, `*.tmp`,
 
 | Function | Description |
 |----------|-------------|
-| `build_index(roots, count)` | Scan directories via LibAnything, build in-memory index |
-| `load_index(records, count)` | Load pre-built index from memory |
-| `search_query(query, type)` | Search (0 = Fuzzy, 1 = Regex) |
+| `load_index_from_file(path)` | Load index from YAML file |
+| `search_query(query, type)` | Search (0 = Fuzzy, 1 = Regex, 2 = Exact) |
 | `get_result_by_index(idx)` | Get result path by position |
 | `index_size()` | Number of indexed files |
-| `last_results_count()` | Number of last search results |
 | `free_c_string(ptr)` | Free a C string allocated by Rust |
 
 ## Tests
@@ -46,7 +45,7 @@ Noise filter (always applied): `thumbs.db`, `desktop.ini`, `.DS_Store`, `*.tmp`,
 cargo test
 ```
 
-8 unit tests covering: empty query, fuzzy, regex, exclude, ext filter, ext exclude, noise filter, exact phrase.
+9 unit tests covering: empty query, fuzzy, regex, exclude, ext filter, ext exclude, noise filter, exact phrase, YAML load.
 
 ## Dependencies
 
@@ -54,4 +53,5 @@ cargo test
 - `regex` — regex search mode
 - `once_cell` — lazy statics
 - `log` — logging facade
-- `libanything` — filesystem indexer
+- `serde` + `serde_yaml` — YAML index serialization
+- `libanything` — filesystem indexer (walks `/`, writes YAML)

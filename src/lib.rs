@@ -1,21 +1,13 @@
 use std::ffi::{c_char, CStr, CString};
-use std::sync::RwLock;
 use std::path::Path;
 
 use fuzzy_matcher::FuzzyMatcher;
-use once_cell::sync::Lazy;
 use regex::Regex;
+use libanything::FileRecord;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Структуры данных
+// Parsed query
 // ──────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct FileRecord {
-    pub id: u64,
-    pub parent_id: u64,
-    pub name: String,
-}
 
 #[derive(Debug, Default)]
 struct ParsedQuery {
@@ -27,63 +19,184 @@ struct ParsedQuery {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Глобальное состояние
+// SearchEngine
 // ──────────────────────────────────────────────────────────────────────────────
 
-static INDEX: Lazy<RwLock<Vec<FileRecord>>> = Lazy::new(|| RwLock::new(Vec::new()));
-static LAST_RESULTS: Lazy<RwLock<Vec<u64>>> = Lazy::new(|| RwLock::new(Vec::new()));
+pub struct SearchEngine {
+    records: Vec<FileRecord>,
+}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Cached temp‑directory paths for noise filter
-// ──────────────────────────────────────────────────────────────────────────────
+impl SearchEngine {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let reader = libanything::IndexReader::open(path.as_ref())?;
 
-static TEMP_PATHS: Lazy<Vec<String>> = Lazy::new(|| {
-    let mut paths = Vec::new();
-    for var in &["TEMP", "TMP", "LOCALAPPDATA", "USERPROFILE"] {
-        if let Ok(val) = std::env::var(var) {
-            let lower = val.to_lowercase();
-            match *var {
-                "LOCALAPPDATA" => paths.push(format!("{}\\temp", lower)),
-                "USERPROFILE" => paths.push(format!("{}\\appdata\\local\\temp", lower)),
-                _ => paths.push(lower),
-            }
+        let records: Vec<FileRecord> = reader
+            .entries
+            .iter()
+            .map(|e| FileRecord {
+                id: e.id as u64,
+                parent_id: e.parent_id as u64,
+                name: reader.get_name(e).to_string(),
+            })
+            .collect();
+
+        if !reader.changed_drives.is_empty() {
+            log::warn!("Changed/missing drives: {:?}", reader.changed_drives);
+        }
+
+        log::info!("Loaded {} records from index", records.len());
+        Ok(SearchEngine { records })
+    }
+
+    pub fn from_records(records: Vec<FileRecord>) -> Self {
+        SearchEngine { records }
+    }
+
+    pub fn index_size(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn default_ignore_config() -> libanything::IgnoreConfig {
+        libanything::IgnoreConfig {
+            skip_dir_prefixes: vec![
+                "/proc".into(),
+                "/sys".into(),
+                "/dev".into(),
+                "/run".into(),
+                "/snap".into(),
+                "/lost+found".into(),
+                "/tmp".into(),
+                "/boot".into(),
+                "/lib".into(),
+                "/lib64".into(),
+                "/usr/lib".into(),
+                "/usr/lib64".into(),
+                "/usr/share/zoneinfo".into(),
+                "/usr/share/doc".into(),
+                "/usr/share/help".into(),
+                "/usr/share/man".into(),
+                "/usr/include".into(),
+                "/usr/src".into(),
+                "/var/cache".into(),
+                "/var/log".into(),
+                "/var/tmp".into(),
+                "/opt".into(),
+                "/sysroot".into(),
+                "/var/lib/docker".into(),
+                "/var/lib/flatpak".into(),
+            ],
+            skip_file_names: vec![
+                "thumbs.db".into(),
+                "desktop.ini".into(),
+                ".ds_store".into(),
+                "icon\r".into(),
+            ],
+            skip_file_exts: vec![
+                "tmp".into(),
+                "temp".into(),
+                "bak".into(),
+            ],
         }
     }
-    paths
-});
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Утилиты
-// ──────────────────────────────────────────────────────────────────────────────
+    pub fn load_ignore_config_yaml(path: &Path) -> Result<libanything::IgnoreConfig, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| format!("read: {}", e))?;
+        #[derive(serde::Deserialize)]
+        struct RawConfig {
+            skip_dir_prefixes: Option<Vec<String>>,
+            skip_file_names: Option<Vec<String>>,
+            skip_file_exts: Option<Vec<String>>,
+        }
+        let raw: RawConfig = serde_yaml::from_str(&content).map_err(|e| format!("yaml: {}", e))?;
+        let mut config = libanything::IgnoreConfig::new();
+        if let Some(v) = raw.skip_dir_prefixes {
+            config.skip_dir_prefixes = v;
+        }
+        if let Some(v) = raw.skip_file_names {
+            config.skip_file_names = v;
+        }
+        if let Some(v) = raw.skip_file_exts {
+            config.skip_file_exts = v;
+        }
+        Ok(config)
+    }
 
-unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
-    if ptr.is_null() { return ""; }
-    CStr::from_ptr(ptr).to_str().unwrap_or_default()
-}
+    pub fn search(&self, query: &str, search_type: SearchType) -> Vec<&FileRecord> {
+        if query.is_empty() {
+            return Vec::new();
+        }
 
-#[no_mangle]
-pub extern "C" fn free_c_string(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        unsafe { let _ = CString::from_raw(ptr); }
+        let parsed = parse_query(query);
+        if self.records.is_empty() {
+            log::warn!("search: index is empty");
+            return Vec::new();
+        }
+
+        let candidates: Vec<&FileRecord> = if has_any_positive_term(&parsed) {
+            let search_str = build_search_string(&parsed);
+            match search_type {
+                SearchType::Fuzzy => {
+                    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+                    let mut scored: Vec<(i64, &FileRecord)> = self.records
+                        .iter()
+                        .filter_map(|r| matcher.fuzzy_match(&r.name, &search_str).map(|s| (s, r)))
+                        .filter(|(s, _)| *s > 40)
+                        .collect();
+                    scored.sort_by(|a, b| b.0.cmp(&a.0));
+                    scored.into_iter().map(|(_, r)| r).collect()
+                }
+                SearchType::Regex => {
+                    let re = match Regex::new(&search_str) {
+                        Ok(r) => r,
+                        Err(_) => return Vec::new(),
+                    };
+                    self.records
+                        .iter()
+                        .filter(|r| re.is_match(&r.name))
+                        .collect()
+                }
+                SearchType::Exact => self
+                    .records
+                    .iter()
+                    .filter(|r| r.name.to_lowercase().contains(&search_str))
+                    .collect(),
+            }
+        } else {
+            self.records.iter().collect()
+        };
+
+        candidates
+            .into_iter()
+            .filter(|r| passes_all_filters(r, &parsed))
+            .collect()
     }
 }
 
-fn str_to_cstr_owned(s: &str) -> *mut c_char {
-    CString::new(s).expect("CString::new failed").into_raw()
+// ──────────────────────────────────────────────────────────────────────────────
+// Search type
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchType {
+    Fuzzy,
+    Regex,
+    Exact,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Парсинг запроса (Everything‑like синтаксис)
+// Tokenizer
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn tokenize(raw: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
-
     for c in raw.chars() {
         match c {
-            '"' => { current.push(c); in_quote = !in_quote; }
+            '"' => {
+                current.push(c);
+                in_quote = !in_quote;
+            }
             ' ' if !in_quote => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
@@ -108,7 +221,8 @@ fn parse_query(raw: &str) -> ParsedQuery {
                 (false, rest)
             };
             if !val.is_empty() {
-                q.ext_filters.push((val.trim_start_matches('.').to_lowercase(), exclude));
+                q.ext_filters
+                    .push((val.trim_start_matches('.').to_lowercase(), exclude));
             }
         } else if let Some(rest) = token.strip_prefix("path:") {
             let (exclude, val) = if let Some(v) = rest.strip_prefix('!') {
@@ -124,7 +238,7 @@ fn parse_query(raw: &str) -> ParsedQuery {
                 q.exclude_terms.push(rest.to_lowercase());
             }
         } else if token.starts_with('"') && token.ends_with('"') && token.len() > 1 {
-            q.exact_phrases.push(token[1..token.len()-1].to_lowercase());
+            q.exact_phrases.push(token[1..token.len() - 1].to_lowercase());
         } else {
             q.include_terms.push(token.to_lowercase());
         }
@@ -135,9 +249,13 @@ fn parse_query(raw: &str) -> ParsedQuery {
 fn build_search_string(q: &ParsedQuery) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for t in &q.include_terms {
-        if !t.contains('*') { parts.push(t); }
+        if !t.contains('*') {
+            parts.push(t);
+        }
     }
-    for p in &q.exact_phrases { parts.push(p); }
+    for p in &q.exact_phrases {
+        parts.push(p);
+    }
     parts.join(" ")
 }
 
@@ -146,7 +264,7 @@ fn has_any_positive_term(q: &ParsedQuery) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Фильтры (пост‑обработка)
+// Filters
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn contains_exclude_terms(lower_path: &str, q: &ParsedQuery) -> bool {
@@ -158,7 +276,9 @@ fn matches_exact_phrases(lower_path: &str, q: &ParsedQuery) -> bool {
 }
 
 fn matches_ext_filters(lower_path: &str, q: &ParsedQuery) -> bool {
-    if q.ext_filters.is_empty() { return true; }
+    if q.ext_filters.is_empty() {
+        return true;
+    }
     let ext = Path::new(lower_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -166,82 +286,59 @@ fn matches_ext_filters(lower_path: &str, q: &ParsedQuery) -> bool {
         .to_lowercase();
     for (filter_ext, exclude) in &q.ext_filters {
         let match_ext = ext == *filter_ext;
-        if *exclude && match_ext { return false; }
-        if !*exclude && !match_ext { return false; }
+        if *exclude && match_ext {
+            return false;
+        }
+        if !*exclude && !match_ext {
+            return false;
+        }
     }
     true
 }
 
 fn matches_path_filters(lower_path: &str, q: &ParsedQuery) -> bool {
-    if q.path_filters.is_empty() { return true; }
+    if q.path_filters.is_empty() {
+        return true;
+    }
     for (filter_path, exclude) in &q.path_filters {
         let match_path = lower_path.starts_with(filter_path);
-        if *exclude && match_path { return false; }
-        if !*exclude && !match_path { return false; }
+        if *exclude && match_path {
+            return false;
+        }
+        if !*exclude && !match_path {
+            return false;
+        }
     }
     true
 }
 
 fn matches_wildcard_terms(lower_name: &str, q: &ParsedQuery) -> bool {
     for term in &q.include_terms {
-        if !term.contains('*') { continue; }
+        if !term.contains('*') {
+            continue;
+        }
         let parts: Vec<&str> = term.split('*').filter(|p| !p.is_empty()).collect();
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
 
         let mut pos = 0;
         for (i, part) in parts.iter().enumerate() {
             match lower_name[pos..].find(part) {
                 Some(idx) => {
-                    if i == 0 && !term.starts_with('*') && idx != 0 { return false; }
+                    if i == 0 && !term.starts_with('*') && idx != 0 {
+                        return false;
+                    }
                     pos += idx + part.len();
                 }
                 None => return false,
             }
         }
-        if !term.ends_with('*') && pos < lower_name.len() { return false; }
+        if !term.ends_with('*') && pos < lower_name.len() {
+            return false;
+        }
     }
     true
-}
-
-fn is_noise_file(lower_path: &str) -> bool {
-    let name = match Path::new(lower_path).file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    let lower_name = name.to_lowercase();
-
-    // Known OS / editor noise files
-    if matches!(
-        lower_name.as_str(),
-        "thumbs.db" | "desktop.ini" | ".ds_store" | "icon\r"
-    ) {
-        return true;
-    }
-
-    if lower_name.ends_with('~') { return true; }
-
-    if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        if matches!(ext_lower.as_str(), "tmp" | "temp" | "bak") {
-            return true;
-        }
-        // Numeric‑only names with .tmp (VS Code temp files)
-        if ext_lower == "tmp" {
-            let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.len() > 4 && stem.chars().all(|c| c.is_ascii_digit()) {
-                return true;
-            }
-        }
-    }
-
-    // Files in system temp directories
-    for temp_path in TEMP_PATHS.iter() {
-        if lower_path.starts_with(temp_path) {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn passes_all_filters(record: &FileRecord, q: &ParsedQuery) -> bool {
@@ -252,270 +349,247 @@ fn passes_all_filters(record: &FileRecord, q: &ParsedQuery) -> bool {
         .unwrap_or("")
         .to_lowercase();
 
-    // Noise filter (skip if matches noise pattern)
-    if is_noise_file(&lower_path) {
+    let ignore = SearchEngine::default_ignore_config();
+    if ignore.is_noise(&record.name) {
         return false;
     }
 
-    // Exclusion terms
-    if contains_exclude_terms(&lower_path, q) { return false; }
-
-    // Exact phrases
-    if !matches_exact_phrases(&lower_path, q) { return false; }
-
-    // Extension filters
-    if !matches_ext_filters(&lower_path, q) { return false; }
-
-    // Path filters
-    if !matches_path_filters(&lower_path, q) { return false; }
-
-    // Wildcard terms
-    if !matches_wildcard_terms(&lower_name, q) { return false; }
+    if contains_exclude_terms(&lower_path, q) {
+        return false;
+    }
+    if !matches_exact_phrases(&lower_path, q) {
+        return false;
+    }
+    if !matches_ext_filters(&lower_path, q) {
+        return false;
+    }
+    if !matches_path_filters(&lower_path, q) {
+        return false;
+    }
+    if !matches_wildcard_terms(&lower_name, q) {
+        return false;
+    }
 
     true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// FFI: загрузка индекса
+// FFI exports (for single .so/.dll)
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[repr(C)]
-pub struct FileRecordFFI {
-    pub id: u64,
-    pub parent_id: u64,
-    pub name: *const c_char,
+use std::sync::Mutex;
+
+static ENGINE: once_cell::sync::Lazy<Mutex<Option<SearchEngine>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+static LAST_RESULTS: once_cell::sync::Lazy<Mutex<Vec<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
+
+unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
+    if ptr.is_null() {
+        return "";
+    }
+    CStr::from_ptr(ptr).to_str().unwrap_or_default()
+}
+
+fn str_to_cstr_owned(s: &str) -> *mut c_char {
+    CString::new(s).expect("CString::new failed").into_raw()
 }
 
 #[no_mangle]
-pub extern "C" fn load_index(records: *const FileRecordFFI, count: u64) -> i32 {
-    if records.is_null() { log::error!("load_index: records is null"); return -1; }
-    let slice = unsafe { std::slice::from_raw_parts(records, count as usize) };
-    let mut vector: Vec<FileRecord> = Vec::with_capacity(slice.len());
-    for rec in slice {
-        let name = unsafe { cstr_to_str(rec.name) };
-        vector.push(FileRecord { id: rec.id, parent_id: rec.parent_id, name: name.to_string() });
-    }
-    if let Ok(mut idx) = INDEX.write() { *idx = vector; } else { return -1; }
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn build_index(roots: *const *const c_char, count: u64) -> i32 {
-    if roots.is_null() { log::error!("build_index: roots is null"); return -1; }
-    let root_slice = unsafe { std::slice::from_raw_parts(roots, count as usize) };
-    let root_strs: Vec<String> = root_slice
-        .iter().map(|&p| unsafe { cstr_to_str(p) }.to_string()).collect();
-    let root_refs: Vec<&str> = root_strs.iter().map(|s| s.as_str()).collect();
-
-    let paths = libanything::scan_directories(&root_refs);
-    if paths.is_empty() { log::warn!("build_index: no files found"); return -1; }
-
-    let records: Vec<FileRecord> = paths.into_iter().enumerate().map(|(i, name)| {
-        FileRecord { id: (i + 1) as u64, parent_id: 0, name }
-    }).collect();
-
-    if let Ok(mut idx) = INDEX.write() { *idx = records; } else { return -1; }
-    if let Ok(mut results) = LAST_RESULTS.write() { results.clear(); }
-    0
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// FFI: поиск (Everything‑like синтаксис + фильтры встроены)
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[repr(C)]
-pub enum SearchType { Fuzzy = 0, Regex = 1 }
-
-fn do_search(query_str: &str, search_type: SearchType) -> u64 {
-    if query_str.is_empty() {
-        if let Ok(mut results) = LAST_RESULTS.write() { results.clear(); }
-        return 0;
-    }
-
-    let parsed = parse_query(query_str);
-    let index = match INDEX.read() { Ok(idx) => idx, Err(_) => return 0 };
-    if index.is_empty() { log::warn!("search_query: index is empty"); return 0; }
-
-    // Step 1: get candidate ids (fuzzy/regex match or all)
-    let candidate_ids: Vec<u64> = if has_any_positive_term(&parsed) {
-        let search_str = build_search_string(&parsed);
-        match search_type {
-            SearchType::Regex => {
-                let re = match Regex::new(&search_str) { Ok(r) => r, Err(_) => return 0 };
-                index.iter().filter(|r| re.is_match(&r.name)).map(|r| r.id).collect()
+pub extern "C" fn load_index_from_file(path: *const c_char) -> i32 {
+    let file_path = unsafe { cstr_to_str(path) };
+    match SearchEngine::load(file_path) {
+        Ok(engine) => {
+            if let Ok(mut guard) = ENGINE.lock() {
+                *guard = Some(engine);
             }
-            SearchType::Fuzzy => {
-                let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-                index.iter()
-                    .filter(|r| matcher.fuzzy_match(&r.name, &search_str).is_some())
-                    .map(|r| r.id)
-                    .collect()
-            }
+            0
         }
-    } else {
-        // Only filters / exclusions — start with all items
-        index.iter().map(|r| r.id).collect()
+        Err(e) => {
+            log::error!("load_index_from_file: {}", e);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn search_query(query: *const c_char, search_type: i32) -> u64 {
+    let query_str = unsafe { cstr_to_str(query) };
+    let st = match search_type {
+        0 => SearchType::Fuzzy,
+        1 => SearchType::Regex,
+        2 => SearchType::Exact,
+        _ => SearchType::Fuzzy,
     };
 
-    // Step 2: apply all filters
-    let filtered: Vec<u64> = candidate_ids.into_iter()
-        .filter(|&id| {
-            index.iter().find(|r| r.id == id).is_some_and(|r| passes_all_filters(r, &parsed))
-        })
-        .collect();
+    let guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return 0,
+    };
 
-    let count = filtered.len() as u64;
-    if let Ok(mut results) = LAST_RESULTS.write() { *results = filtered; }
-    count
+    let results = engine.search(query_str, st);
+    let paths: Vec<String> = results.iter().map(|r| r.name.clone()).collect();
+    let count = paths.len();
+    drop(guard);
+
+    if let Ok(mut last) = LAST_RESULTS.lock() {
+        *last = paths;
+    }
+    count as u64
 }
-
-#[no_mangle]
-pub extern "C" fn search_query(query: *const c_char, search_type: SearchType) -> u64 {
-    let query_str = unsafe { cstr_to_str(query) };
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        do_search(query_str, search_type)
-    })).unwrap_or(0)
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// FFI: получение результатов
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn get_result_by_index(idx: u64) -> *mut c_char {
-    let results = LAST_RESULTS.read().unwrap();
-    let Some(&record_id) = results.get(idx as usize) else {
-        return std::ptr::null_mut();
+    let guard = match LAST_RESULTS.lock() {
+        Ok(g) => g,
+        Err(_) => return std::ptr::null_mut(),
     };
-    drop(results);
-    let index = INDEX.read().unwrap();
-    let record = match index.iter().find(|r| r.id == record_id) {
-        Some(r) => r, None => return std::ptr::null_mut(),
-    };
-    str_to_cstr_owned(&record.name)
+    guard
+        .get(idx as usize)
+        .map(|s| str_to_cstr_owned(s))
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub extern "C" fn index_size() -> u64 {
-    INDEX.read().unwrap().len() as u64
+    let guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    guard.as_ref().map(|e| e.index_size() as u64).unwrap_or(0)
 }
 
 #[no_mangle]
-pub extern "C" fn last_results_count() -> u64 {
-    LAST_RESULTS.read().unwrap().len() as u64
+pub extern "C" fn free_c_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = CString::from_raw(ptr);
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Тесты
+// Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn build_test_data() -> Vec<FileRecordFFI> {
-        let names = [
-            "/home/user/documents/report.pdf",
-            "/home/user/documents/photo.jpg",
-            "/home/user/music/song.mp3",
-            "/home/user/videos/movie.mp4",
-            "/home/user/documents/notes.txt",
-            "/home/user/temp/12345.tmp",
-            "/home/user/temp/notes.tmp",
-        ];
-        names.iter().enumerate().map(|(i, name)| {
-            let c_name = CString::new(*name).unwrap();
-            FileRecordFFI { id: i as u64 + 1, parent_id: 0, name: c_name.into_raw() }
-        }).collect()
+    fn test_records() -> Vec<FileRecord> {
+        vec![
+            FileRecord { id: 1, parent_id: 0, name: "/home/user/documents/report.pdf".into() },
+            FileRecord { id: 2, parent_id: 0, name: "/home/user/documents/photo.jpg".into() },
+            FileRecord { id: 3, parent_id: 0, name: "/home/user/music/song.mp3".into() },
+            FileRecord { id: 4, parent_id: 0, name: "/home/user/videos/movie.mp4".into() },
+            FileRecord { id: 5, parent_id: 0, name: "/home/user/documents/notes.txt".into() },
+            FileRecord { id: 6, parent_id: 0, name: "/home/user/temp/12345.tmp".into() },
+            FileRecord { id: 7, parent_id: 0, name: "/home/user/temp/notes.tmp".into() },
+        ]
     }
 
-    fn free_test_data(data: &[FileRecordFFI]) {
-        for rec in data {
-            if !rec.name.is_null() {
-                unsafe { let _ = CString::from_raw(rec.name as *mut c_char); }
-            }
-        }
+    fn make_engine() -> SearchEngine {
+        SearchEngine::from_records(test_records())
     }
 
     #[test]
     fn test_fuzzy_search() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("repo").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        assert!(count > 0);
-        let ptr = get_result_by_index(0);
-        assert!(!ptr.is_null());
-        free_c_string(ptr);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("repo", SearchType::Fuzzy);
+        assert!(!results.is_empty());
+        assert!(results[0].name.contains("report"));
     }
 
     #[test]
     fn test_regex_search() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new(r"\.(pdf|jpg)$").unwrap();
-        assert_eq!(search_query(query.as_ptr(), SearchType::Regex), 2);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search(r"\.(pdf|jpg)$", SearchType::Regex);
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_exclude_filter() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("doc !photo").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        // "doc" matches 3 files in "documents/", !photo excludes photo.jpg
-        assert_eq!(count, 2);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("doc !photo", SearchType::Fuzzy);
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_ext_filter() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("ext:pdf").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        assert_eq!(count, 1);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("ext:pdf", SearchType::Fuzzy);
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn test_ext_exclude_filter() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("ext:!tmp").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        assert_eq!(count, 5);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("ext:!tmp", SearchType::Fuzzy);
+        assert_eq!(results.len(), 5);
     }
 
     #[test]
     fn test_noise_filter_skips_numeric_tmp() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("12345").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        assert_eq!(count, 0);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("12345", SearchType::Fuzzy);
+        assert!(results.is_empty());
     }
 
     #[test]
     fn test_exact_phrase() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("\"report.pdf\"").unwrap();
-        let count = search_query(query.as_ptr(), SearchType::Fuzzy);
-        assert_eq!(count, 1);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("\"report.pdf\"", SearchType::Fuzzy);
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn test_empty_query() {
-        let data = build_test_data();
-        load_index(data.as_ptr(), data.len() as u64);
-        let query = CString::new("").unwrap();
-        assert_eq!(search_query(query.as_ptr(), SearchType::Fuzzy), 0);
-        free_test_data(&data);
+        let engine = make_engine();
+        let results = engine.search("", SearchType::Fuzzy);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_binary_load() {
+        let tmp = std::env::temp_dir().join("searchengine-test.anythingindex");
+        let records = vec![
+            FileRecord { id: 1, parent_id: 0, name: "/home/test/file.txt".into() },
+            FileRecord { id: 2, parent_id: 1, name: "/home/test/other.pdf".into() },
+        ];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        libanything::build_index_file(&records, &tmp, false, &cancel).unwrap();
+
+        let engine = SearchEngine::load(&tmp).unwrap();
+        assert_eq!(engine.index_size(), 2);
+        let results = engine.search("file", SearchType::Fuzzy);
+        assert_eq!(results.len(), 1);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_ignore_config_default() {
+        let ig = SearchEngine::default_ignore_config();
+        assert!(ig.is_skip_dir(std::path::Path::new("/proc")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/proc/self")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/tmp")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/boot")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/lib")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/lib64")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/zoneinfo")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/doc")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/usr/include")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/var/cache")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/var/log")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/opt")));
+        assert!(ig.is_skip_dir(std::path::Path::new("/sysroot")));
+        assert!(ig.is_noise("/home/user/thumbs.db"));
+        assert!(ig.is_noise("/tmp/foo.tmp"));
+        assert!(!ig.is_noise("/home/user/report.pdf"));
+        assert!(!ig.is_skip_dir(std::path::Path::new("/home/user/proc")));
     }
 }
