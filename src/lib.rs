@@ -5,10 +5,6 @@ use fuzzy_matcher::FuzzyMatcher;
 use regex::Regex;
 use libanything::FileRecord;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Parsed query
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Default)]
 struct ParsedQuery {
     include_terms: Vec<String>,
@@ -17,10 +13,6 @@ struct ParsedQuery {
     ext_filters: Vec<(String, bool)>,
     path_filters: Vec<(String, bool)>,
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// SearchEngine
-// ──────────────────────────────────────────────────────────────────────────────
 
 pub struct SearchEngine {
     records: Vec<FileRecord>,
@@ -133,20 +125,26 @@ impl SearchEngine {
         }
 
         let candidates: Vec<&FileRecord> = if has_any_positive_term(&parsed) {
-            let search_str = build_search_string(&parsed);
+            let search_terms = build_search_string(&parsed);
             match search_type {
                 SearchType::Fuzzy => {
                     let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
                     let mut scored: Vec<(i64, &FileRecord)> = self.records
                         .iter()
-                        .filter_map(|r| matcher.fuzzy_match(&r.name, &search_str).map(|s| (s, r)))
-                        .filter(|(s, _)| *s > 40)
+                        .filter_map(|r| {
+                            let mut total: i64 = 0;
+                            for term in &search_terms {
+                                total += matcher.fuzzy_match(&r.name, term)?;
+                            }
+                            if total > 40 { Some((total, r)) } else { None }
+                        })
                         .collect();
                     scored.sort_by(|a, b| b.0.cmp(&a.0));
                     scored.into_iter().map(|(_, r)| r).collect()
                 }
                 SearchType::Regex => {
-                    let re = match Regex::new(&search_str) {
+                    let joined: String = search_terms.join(" ");
+                    let re = match Regex::new(&joined) {
                         Ok(r) => r,
                         Err(_) => return Vec::new(),
                     };
@@ -155,11 +153,15 @@ impl SearchEngine {
                         .filter(|r| re.is_match(&r.name))
                         .collect()
                 }
-                SearchType::Exact => self
-                    .records
-                    .iter()
-                    .filter(|r| r.name.to_lowercase().contains(&search_str))
-                    .collect(),
+                SearchType::Exact => {
+                    self.records
+                        .iter()
+                        .filter(|r| {
+                            let lower_name = r.name.to_lowercase();
+                            search_terms.iter().all(|t| lower_name.contains(t))
+                        })
+                        .collect()
+                }
             }
         } else {
             self.records.iter().collect()
@@ -172,20 +174,12 @@ impl SearchEngine {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Search type
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchType {
     Fuzzy,
     Regex,
     Exact,
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tokenizer
-// ──────────────────────────────────────────────────────────────────────────────
 
 fn tokenize(raw: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -246,26 +240,22 @@ fn parse_query(raw: &str) -> ParsedQuery {
     q
 }
 
-fn build_search_string(q: &ParsedQuery) -> String {
-    let mut parts: Vec<&str> = Vec::new();
+fn build_search_string(q: &ParsedQuery) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
     for t in &q.include_terms {
         if !t.contains('*') {
-            parts.push(t);
+            parts.push(t.clone());
         }
     }
     for p in &q.exact_phrases {
-        parts.push(p);
+        parts.push(p.clone());
     }
-    parts.join(" ")
+    parts
 }
 
 fn has_any_positive_term(q: &ParsedQuery) -> bool {
     !q.include_terms.is_empty() || !q.exact_phrases.is_empty()
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Filters
-// ──────────────────────────────────────────────────────────────────────────────
 
 fn contains_exclude_terms(lower_path: &str, q: &ParsedQuery) -> bool {
     q.exclude_terms.iter().any(|t| lower_path.contains(t))
@@ -373,10 +363,6 @@ fn passes_all_filters(record: &FileRecord, q: &ParsedQuery) -> bool {
     true
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// FFI exports (for single .so/.dll)
-// ──────────────────────────────────────────────────────────────────────────────
-
 use std::sync::Mutex;
 
 static ENGINE: once_cell::sync::Lazy<Mutex<Option<SearchEngine>>> =
@@ -472,10 +458,6 @@ pub extern "C" fn free_c_string(ptr: *mut c_char) {
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
