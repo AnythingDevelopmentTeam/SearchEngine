@@ -49,34 +49,49 @@ impl SearchEngine {
     }
 
     pub fn default_ignore_config() -> libanything::IgnoreConfig {
+        let mut skip_dirs: Vec<String> = vec![
+            "/proc".into(),
+            "/sys".into(),
+            "/dev".into(),
+            "/run".into(),
+            "/snap".into(),
+            "/lost+found".into(),
+            "/tmp".into(),
+            "/boot".into(),
+            "/lib".into(),
+            "/lib64".into(),
+            "/usr/lib".into(),
+            "/usr/lib64".into(),
+            "/usr/share/zoneinfo".into(),
+            "/usr/share/doc".into(),
+            "/usr/share/help".into(),
+            "/usr/share/man".into(),
+            "/usr/include".into(),
+            "/usr/src".into(),
+            "/var/cache".into(),
+            "/var/log".into(),
+            "/var/tmp".into(),
+            "/opt".into(),
+            "/sysroot".into(),
+            "/var/lib/docker".into(),
+            "/var/lib/flatpak".into(),
+        ];
+
+        #[cfg(windows)]
+        skip_dirs.extend([
+            "C:\\Windows".into(),
+            "C:\\Program Files".into(),
+            "C:\\Program Files (x86)".into(),
+            "C:\\ProgramData".into(),
+            "C:\\Recovery".into(),
+            "C:\\System Volume Information".into(),
+            "C:\\$Recycle.Bin".into(),
+            "C:\\MSOCache".into(),
+            "C:\\PerfLogs".into(),
+        ]);
+
         libanything::IgnoreConfig {
-            skip_dir_prefixes: vec![
-                "/proc".into(),
-                "/sys".into(),
-                "/dev".into(),
-                "/run".into(),
-                "/snap".into(),
-                "/lost+found".into(),
-                "/tmp".into(),
-                "/boot".into(),
-                "/lib".into(),
-                "/lib64".into(),
-                "/usr/lib".into(),
-                "/usr/lib64".into(),
-                "/usr/share/zoneinfo".into(),
-                "/usr/share/doc".into(),
-                "/usr/share/help".into(),
-                "/usr/share/man".into(),
-                "/usr/include".into(),
-                "/usr/src".into(),
-                "/var/cache".into(),
-                "/var/log".into(),
-                "/var/tmp".into(),
-                "/opt".into(),
-                "/sysroot".into(),
-                "/var/lib/docker".into(),
-                "/var/lib/flatpak".into(),
-            ],
+            skip_dir_prefixes: skip_dirs,
             skip_file_names: vec![
                 "thumbs.db".into(),
                 "desktop.ini".into(),
@@ -556,22 +571,37 @@ mod tests {
     #[test]
     fn test_ignore_config_default() {
         let ig = SearchEngine::default_ignore_config();
-        assert!(ig.is_skip_dir(std::path::Path::new("/proc")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/proc/self")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/tmp")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/boot")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/lib")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/lib64")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/zoneinfo")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/doc")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/usr/include")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/var/cache")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/var/log")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/opt")));
-        assert!(ig.is_skip_dir(std::path::Path::new("/sysroot")));
+
+        #[cfg(unix)]
+        {
+            assert!(ig.is_skip_dir(std::path::Path::new("/proc")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/proc/self")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/tmp")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/boot")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/lib")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/lib64")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/zoneinfo")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/usr/share/doc")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/usr/include")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/var/cache")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/var/log")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/opt")));
+            assert!(ig.is_skip_dir(std::path::Path::new("/sysroot")));
+            assert!(!ig.is_skip_dir(std::path::Path::new("/home/user/proc")));
+        }
+
+        #[cfg(windows)]
+        {
+            assert!(ig.is_skip_dir(std::path::Path::new("C:\\Windows")));
+            assert!(ig.is_skip_dir(std::path::Path::new("C:\\Windows\\System32")));
+            assert!(ig.is_skip_dir(std::path::Path::new("C:\\Program Files\\Google")));
+            assert!(ig.is_skip_dir(std::path::Path::new("C:\\Program Files (x86)")));
+            assert!(ig.is_skip_dir(std::path::Path::new("C:\\ProgramData")));
+            assert!(!ig.is_skip_dir(std::path::Path::new("C:\\Users\\User\\Documents")));
+        }
+
         assert!(ig.is_noise("/home/user/thumbs.db"));
         assert!(ig.is_noise("/tmp/foo.tmp"));
         assert!(!ig.is_noise("/home/user/report.pdf"));
-        assert!(!ig.is_skip_dir(std::path::Path::new("/home/user/proc")));
     }
 }

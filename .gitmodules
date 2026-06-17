@@ -1,0 +1,3 @@
+[submodule "lib/LibAnything"]
+	path = lib/LibAnything
+	url = https://github.com/AnythingDevelopmentTeam/LibAnything.git
