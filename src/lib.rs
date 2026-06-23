@@ -49,7 +49,7 @@ impl SearchEngine {
     }
 
     pub fn default_ignore_config() -> libanything::IgnoreConfig {
-        let mut skip_dirs: Vec<String> = vec![
+        let skip_dirs: Vec<String> = vec![
             "/proc".into(),
             "/sys".into(),
             "/dev".into(),
@@ -470,6 +470,57 @@ pub extern "C" fn free_c_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             let _ = CString::from_raw(ptr);
+        }
+    }
+}
+
+static INDEXER: once_cell::sync::Lazy<Mutex<Option<libanything::Indexer>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+#[no_mangle]
+pub extern "C" fn start_build_index(path: *const c_char) -> i32 {
+    let file_path = unsafe { std::path::PathBuf::from(cstr_to_str(path)) };
+    let mut idx = libanything::Indexer::new(file_path);
+    idx.set_ignore_config(SearchEngine::default_ignore_config());
+    idx.start();
+    match INDEXER.lock() {
+        Ok(mut guard) => {
+            *guard = Some(idx);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn build_index_status() -> i32 {
+    match INDEXER.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(idx) => match idx.status() {
+                libanything::IndexerStatus::Idle => 0,
+                libanything::IndexerStatus::Running => 1,
+                libanything::IndexerStatus::Completed => 2,
+                libanything::IndexerStatus::Failed => 3,
+            },
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn build_index_progress() -> u64 {
+    match INDEXER.lock() {
+        Ok(guard) => guard.as_ref().map(|idx| idx.progress()).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cancel_build_index() {
+    if let Ok(guard) = INDEXER.lock() {
+        if let Some(ref idx) = *guard {
+            idx.cancel();
         }
     }
 }
