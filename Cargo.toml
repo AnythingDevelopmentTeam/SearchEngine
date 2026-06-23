@@ -6,10 +6,6 @@ edition = "2021"
 [lib]
 crate-type = ["lib", "cdylib"]
 
-[[bin]]
-name = "search"
-path = "src/main.rs"
-
 [dependencies]
 fuzzy-matcher = "0.3.7"
 regex = "1.12.4"

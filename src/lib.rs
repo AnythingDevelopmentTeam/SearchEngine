@@ -3,7 +3,7 @@ use std::path::Path;
 
 use fuzzy_matcher::FuzzyMatcher;
 use regex::Regex;
-use libanything::FileRecord;
+pub use libanything::{FileRecord, IgnoreConfig, Indexer, IndexerStatus};
 
 #[derive(Debug, Default)]
 struct ParsedQuery {
