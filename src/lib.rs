@@ -49,7 +49,8 @@ impl SearchEngine {
     }
 
     pub fn default_ignore_config() -> libanything::IgnoreConfig {
-        let skip_dirs: Vec<String> = vec![
+        #[allow(unused_mut)]
+        let mut skip_dirs: Vec<String> = vec![
             "/proc".into(),
             "/sys".into(),
             "/dev".into(),
