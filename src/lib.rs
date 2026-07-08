@@ -145,14 +145,24 @@ impl SearchEngine {
             match search_type {
                 SearchType::Fuzzy => {
                     let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+                    let min_score: i64 = search_terms
+                        .iter()
+                        .map(|t| std::cmp::max(40, t.len() as i64 * 16))
+                        .sum();
                     let mut scored: Vec<(i64, &FileRecord)> = self.records
                         .iter()
                         .filter_map(|r| {
                             let mut total: i64 = 0;
                             for term in &search_terms {
-                                total += matcher.fuzzy_match(&r.name, term)?;
+                                let basename = Path::new(&r.name)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("");
+                                let score = matcher.fuzzy_match(basename, term)
+                                    .or_else(|| matcher.fuzzy_match(&r.name, term))?;
+                                total += score;
                             }
-                            if total > 40 { Some((total, r)) } else { None }
+                            if total >= min_score { Some((total, r)) } else { None }
                         })
                         .collect();
                     scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -419,10 +429,10 @@ pub extern "C" fn load_index_from_file(path: *const c_char) -> i32 {
 pub extern "C" fn search_query(query: *const c_char, search_type: i32) -> u64 {
     let query_str = unsafe { cstr_to_str(query) };
     let st = match search_type {
-        0 => SearchType::Fuzzy,
+        0 => SearchType::Exact,
         1 => SearchType::Regex,
-        2 => SearchType::Exact,
-        _ => SearchType::Fuzzy,
+        2 => SearchType::Fuzzy,
+        _ => SearchType::Exact,
     };
 
     let guard = match ENGINE.lock() {
